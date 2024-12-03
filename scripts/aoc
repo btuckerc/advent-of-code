@@ -1,0 +1,598 @@
+#!/bin/bash
+# Copyright (c) 2024 Tucker Craig
+# See LICENSE file for full license details.
+
+# Get the absolute directory of the current script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load environment variables from .env files
+if [ -f "$REPO_ROOT/.env.local" ]; then
+    source "$REPO_ROOT/.env.local"
+elif [ -f "$REPO_ROOT/.env" ]; then
+    source "$REPO_ROOT/.env"
+fi
+
+# Function to show usage information
+show_usage() {
+    echo "Usage: $0 COMMAND [OPTIONS] [DAY] [ANSWER]"
+    echo
+    echo "Commands:"
+    echo "  init                Initialize the environment"
+    echo "  setup [DAY]        Set up template for specific day or all days"
+    echo "  get DAY            Download input for specific day"
+    echo "  submit DAY ANSWER  Submit answer for specific day"
+    echo "  help              Show this help message"
+    echo
+    echo "Options:"
+    echo "  -y, --year YEAR    Specify year (default: current year or previous if not December)"
+    echo "  -d, --day DAY      Specify day (default: current day)"
+    echo "  -p, --part PART    Specify part (1 or 2, default: 1)"
+    echo "  -h, --help         Show this help message"
+    exit 1
+}
+
+# Function to create default .env if it doesn't exist
+create_env_file() {
+    if [ ! -f "$REPO_ROOT/.env" ]; then
+        cat > "$REPO_ROOT/.env" << 'EOF'
+# Advent of Code session cookie
+# Replace this with your actual session cookie from:
+# 1. Go to https://adventofcode.com
+# 2. Log in
+# 3. Open Developer Tools (F12 or Command+Option+I)
+# 4. Go to Application > Cookies
+# 5. Copy the value of the 'session' cookie
+AOC_SESSION=replace_this_with_your_session_cookie
+
+# You can also create a .env.local file which will override .env
+# This is useful if you want to keep different settings for different machines
+EOF
+        echo "  ↳ Created default .env file at $REPO_ROOT/.env"
+        echo "  ↳ Please edit it to add your session cookie"
+    fi
+}
+
+# Function to get or update session cookie
+get_session() {
+    local current_session="$AOC_SESSION"
+    
+    # If no session or using default value, prompt for it
+    if [ -z "$current_session" ] || [ "$current_session" = "replace_this_with_your_session_cookie" ]; then
+        echo "Advent of Code session cookie required!"
+        echo "Would you like to:"
+        echo "1. Enter a session cookie now"
+        echo "2. Get instructions for finding your session cookie"
+        echo "3. Cancel"
+        read -p "Choose an option (1-3): " choice
+
+        case $choice in
+            1)
+                read -p "Enter your session cookie: " new_session
+                if [ -f "$REPO_ROOT/.env.local" ]; then
+                    # Update existing .env.local
+                    sed -i.bak "s/^AOC_SESSION=.*/AOC_SESSION=$new_session/" "$REPO_ROOT/.env.local"
+                    rm -f "$REPO_ROOT/.env.local.bak"
+                else
+                    # Create new .env.local
+                    echo "AOC_SESSION=$new_session" > "$REPO_ROOT/.env.local"
+                fi
+                echo "Session cookie saved to .env.local"
+                current_session="$new_session"
+                ;;
+            2)
+                echo ""
+                echo "To get your session cookie:"
+                echo "1. Go to https://adventofcode.com"
+                echo "2. Log in with your account"
+                echo "3. Open Developer Tools:"
+                echo "   - Mac: Press Command+Option+I"
+                echo "   - Windows/Linux: Press F12"
+                echo "4. Go to Application > Cookies > https://adventofcode.com"
+                echo "5. Find the cookie named 'session'"
+                echo "6. Copy its value (long string of characters)"
+                echo ""
+                echo "Then run this command again and choose option 1"
+                exit 1
+                ;;
+            *)
+                echo "Operation cancelled"
+                exit 1
+                ;;
+        esac
+    fi
+    
+    echo "$current_session"
+}
+
+# Function to initialize environment
+init_environment() {
+    echo "Initializing $YEAR environment..."
+    
+    # Create .env file if it doesn't exist
+    create_env_file
+    
+    # Create year directory if it doesn't exist
+    mkdir -p "$REPO_ROOT/$YEAR"
+    echo "  ↳ Created year directory"
+
+    # Set up language-specific structure
+    if [ "$YEAR" = "2024" ]; then
+        LANG="go"
+        if [ ! -f "$REPO_ROOT/$YEAR/go.mod" ]; then
+            (cd "$REPO_ROOT/$YEAR" && go mod init "adventofcode$YEAR")
+            echo "  ↳ Initialized Go module"
+        fi
+    else
+        LANG="python"
+        if [ ! -f "$REPO_ROOT/$YEAR/requirements.txt" ]; then
+            touch "$REPO_ROOT/$YEAR/requirements.txt"
+            echo "  ↳ Created requirements.txt"
+        fi
+    fi
+
+    # Create README if it doesn't exist
+    if [ ! -f "$REPO_ROOT/$YEAR/README.md" ]; then
+        cat > "$REPO_ROOT/$YEAR/README.md" << EOF
+# Advent of Code $YEAR - $LANG Solutions
+
+Solutions for [Advent of Code $YEAR](https://adventofcode.com/$YEAR) in $LANG.
+
+## Structure
+
+Each day's solution is in its own directory:
+- \`$([ "$LANG" = "go" ] && echo "main.go" || echo "solution.py")\` - Solution implementation
+- \`README.md\` - Problem description
+- \`input.txt\` - Puzzle input
+- \`example.txt\` - Example from the problem
+
+## Running Solutions
+
+\`\`\`bash
+cd day01
+$([ "$LANG" = "go" ] && echo "go run main.go" || echo "python solution.py")
+\`\`\`
+
+## Progress
+
+$(for i in {1..25}; do echo "- [ ] Day $i"; done)
+EOF
+        echo "  ↳ Created README.md"
+    fi
+
+    echo "  ✓ Environment initialized for $LANG"
+}
+
+# Function to clean HTML and format markdown
+clean_html() {
+    # Remove HTML tags except specific ones we want to process
+    sed -e 's/<pre><code>/\n```\n/g' \
+        -e 's/<\/code><\/pre>/\n```\n/g' \
+        -e 's/<p>/\n/g' \
+        -e 's/<\/p>/\n/g' \
+        -e 's/<h2>/## /g' \
+        -e 's/<\/h2>/\n/g' \
+        -e 's/<em>/*/g' \
+        -e 's/<\/em>/*/g' \
+        -e 's/<li>/- /g' \
+        -e 's/<\/li>/\n/g' \
+        -e 's/<ul>/\n/g' \
+        -e 's/<\/ul>/\n/g' \
+        -e 's/<article/\n<article/g' \
+        -e 's/<\/article>/\n/g' \
+        -e 's/<[^>]*>//g' \
+        | sed -e 's/&gt;/>/g' \
+        -e 's/&lt;/</g' \
+        -e 's/&quot;/"/g' \
+        -e 's/&apos;/'"'"'/g' \
+        -e 's/&amp;/\&/g' \
+        | sed -e '/^[[:space:]]*$/d' \
+        | awk 'NR>1{print buf}{buf = $0}END{ORS=""; print buf}'
+}
+
+# Function to extract example input from problem description
+extract_example() {
+    local response="$1"
+    local example_file="$2"
+    
+    # Look for "For example:" followed by a code block
+    echo "$response" | \
+    awk '
+        BEGIN { found=0; printing=0; }
+        /For example:/ { found=1; next; }
+        found && /<pre><code>/ { printing=1; next; }
+        printing && /<\/code><\/pre>/ { exit; }
+        printing { print; }
+    ' | sed '/^$/d' > "$example_file"
+    
+    # Check if we got any content
+    if [ ! -s "$example_file" ]; then
+        echo "  ↳ No example input found"
+        rm -f "$example_file"  # Remove empty file
+        return 1
+    else
+        echo "  ✓ Example input saved"
+        return 0
+    fi
+}
+
+# Function to download problem description
+download_description() {
+    local year="$1"
+    local day="$2"
+    local dir="$REPO_ROOT/$year/day$(printf "%02d" "$day")"
+    local desc_file="$dir/README.md"
+    local example_file="$dir/example.txt"
+    local url="https://adventofcode.com/$year/day/$day"
+    
+    if [ -f "$desc_file" ]; then
+        echo "  ↳ Description already exists, skipping"
+        return 0
+    fi
+
+    echo "  ↳ Downloading problem description..."
+    local response
+    response=$(curl -s "$url")
+    
+    if [ $? -ne 0 ]; then
+        echo "  ✗ Failed to download problem description"
+        return 1
+    fi
+
+    # Extract the problem description from the HTML
+    echo "$response" | grep -A 1000 '<article class="day-desc">' | grep -B 1000 '</article>' | clean_html > "$desc_file"
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Problem description saved"
+        # Try to extract example input
+        extract_example "$response" "$example_file"
+    else
+        echo "  ✗ Failed to save problem description"
+        return 1
+    fi
+}
+
+# Function to set up multiple days
+setup_days() {
+    local start_day=${1:-1}
+    local end_day=${2:-$(date +"%d")}
+    local current_month=$(date +"%m")
+    
+    # If no specific range given and not December, require a day
+    if [ -z "$1" ] && [ "$current_month" != "12" ]; then
+        echo "Error: Please specify a day (1-25) when running setup outside of December"
+        show_usage
+        return 1
+    fi
+    
+    # Validate days
+    if ! [[ $start_day =~ ^[0-9]{1,2}$ ]] || [ $start_day -lt 1 ] || [ $start_day -gt 25 ]; then
+        echo "Error: Invalid start day: $start_day (should be 1-25)"
+        return 1
+    fi
+    if ! [[ $end_day =~ ^[0-9]{1,2}$ ]] || [ $end_day -lt 1 ] || [ $end_day -gt 25 ]; then
+        echo "Error: Invalid end day: $end_day (should be 1-25)"
+        return 1
+    fi
+    if [ $start_day -gt $end_day ]; then
+        echo "Error: Start day ($start_day) cannot be after end day ($end_day)"
+        return 1
+    fi
+
+    echo "Setting up days $start_day to $end_day for $YEAR..."
+    for ((day=start_day; day<=end_day; day++)); do
+        setup_day "$day"
+    done
+    echo "✨ Setup complete!"
+}
+
+# Function to set up a day's problem
+setup_day() {
+    local day=$1
+    local dir="$REPO_ROOT/$YEAR/day$(printf "%02d" $day)"
+    
+    # Validate day is in range
+    if [ "$day" -lt 1 ] || [ "$day" -gt 25 ]; then
+        echo "Error: Day must be between 1 and 25"
+        return 1
+    fi
+
+    echo "Setting up day $day..."
+
+    # Create directory
+    mkdir -p "$dir"
+
+    # Check if day is already set up
+    if [ -d "$dir" ] && [ -f "$dir/$([ "$YEAR" = "2024" ] && echo "main.go" || echo "solution.py")" ]; then
+        echo "  ↳ Solution file already exists, skipping"
+    else
+        # Create solution file based on year
+        if [ "$YEAR" = "2024" ]; then
+            echo "  ↳ Creating Go solution file..."
+            cat > "$dir/main.go" << 'EOF'
+package main
+
+import (
+    "bufio"
+    "fmt"
+    "os"
+    "strings"
+)
+
+func part1(input []string) int {
+    // TODO: Implement part 1
+    return 0
+}
+
+func part2(input []string) int {
+    // TODO: Implement part 2
+    return 0
+}
+
+func readInput(filename string) ([]string, error) {
+    file, err := os.Open(filename)
+    if err != nil {
+        return nil, err
+    }
+    defer file.Close()
+
+    var lines []string
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        lines = append(lines, strings.TrimSpace(scanner.Text()))
+    }
+    return lines, scanner.Err()
+}
+
+func main() {
+    input, err := readInput("input.txt")
+    if err != nil {
+        fmt.Println("Using example.txt")
+        input, err = readInput("example.txt")
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Failed to read input: %v\n", err)
+            os.Exit(1)
+        }
+    }
+
+    fmt.Printf("Part 1: %d\n", part1(input))
+    fmt.Printf("Part 2: %d\n", part2(input))
+}
+EOF
+        else
+            echo "  ↳ Creating Python solution file..."
+            cat > "$dir/solution.py" << 'EOF'
+def part1(input_data):
+    # TODO: Implement part 1
+    return 0
+
+def part2(input_data):
+    # TODO: Implement part 2
+    return 0
+
+def read_input(filename="input.txt"):
+    with open(filename, "r") as f:
+        return [line.strip() for line in f]
+
+if __name__ == "__main__":
+    try:
+        input_data = read_input("input.txt")
+        print("Using input.txt")
+    except FileNotFoundError:
+        print("Using example.txt")
+        input_data = read_input("example.txt")
+    
+    print(f"Part 1: {part1(input_data)}")
+    print(f"Part 2: {part2(input_data)}")
+EOF
+        fi
+    fi
+
+    # Download problem description (this will also try to extract example input)
+    if [ -f "$dir/README.md" ]; then
+        echo "  ↳ Problem description already exists, skipping"
+    else
+        echo "  ↳ Downloading problem description..."
+        download_description "$YEAR" "$day"
+    fi
+
+    # Try to download input if session is available
+    if [ -f "$dir/input.txt" ]; then
+        echo "  ↳ Input file already exists, skipping"
+    elif [ -n "$AOC_SESSION" ]; then
+        echo "  ↳ Downloading input file..."
+        download_input "$day"
+    else
+        echo "  ↳ Set AOC_SESSION environment variable to download input automatically"
+    fi
+
+    echo "  ✓ Day $day setup complete"
+}
+
+# Function to download input
+download_input() {
+    local day=$1
+    local dir="$REPO_ROOT/$YEAR/day$(printf "%02d" $day)"
+
+    # Get session cookie
+    local session=$(get_session)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    # Check if input already exists and has content
+    if [ -f "$dir/input.txt" ] && [ -s "$dir/input.txt" ]; then
+        echo "  ↳ Input already exists, skipping"
+        return 0
+    fi
+
+    mkdir -p "$dir"
+    echo "  ↳ Downloading input..."
+    curl -s \
+        -H "Cookie: session=$session" \
+        -H "User-Agent: github.com/tuckersn/AdventOfCode by tucker@tuckersnow.com" \
+        "https://adventofcode.com/$YEAR/day/$day/input" > "$dir/input.txt.tmp"
+
+    # Check for specific error cases
+    if grep -q "Puzzle inputs differ by user" "$dir/input.txt.tmp"; then
+        echo "  ✗ Invalid session cookie"
+        rm "$dir/input.txt.tmp"
+        return 1
+    elif [ ! -s "$dir/input.txt.tmp" ]; then
+        echo "  ✗ Could not download input (empty response)"
+        rm "$dir/input.txt.tmp"
+        return 1
+    elif grep -q "Please log in to get your puzzle input" "$dir/input.txt.tmp"; then
+        echo "  ✗ Session cookie has expired or is invalid"
+        rm "$dir/input.txt.tmp"
+        return 1
+    fi
+
+    mv "$dir/input.txt.tmp" "$dir/input.txt"
+    echo "  ✓ Input downloaded"
+}
+
+# Function to submit answer
+submit_answer() {
+    local day=$1
+    local answer=$2
+    local dir="$REPO_ROOT/$YEAR/day$(printf "%02d" $day)"
+
+    # Get session cookie
+    local session=$(get_session)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    echo "  ↳ Submitting answer for Day $day Part $PART: $answer"
+    response=$(curl -s -X POST \
+        -H "Cookie: session=$session" \
+        -H "User-Agent: github.com/tuckersn/AdventOfCode by tucker@tuckersnow.com" \
+        --data-urlencode "level=$PART" \
+        --data-urlencode "answer=$answer" \
+        "https://adventofcode.com/$YEAR/day/$day/answer")
+
+    if echo "$response" | grep -q "That's the right answer!"; then
+        echo "  ✓ Correct answer!"
+        if [ "$PART" = "1" ]; then
+            echo "  ↳ Part 2 is now unlocked!"
+            # Update problem.md with part 2
+            curl -s \
+                -H "Cookie: session=$session" \
+                -H "User-Agent: github.com/tuckersn/AdventOfCode by tucker@tuckersnow.com" \
+                "https://adventofcode.com/$YEAR/day/$day" | \
+            sed -n '/<main>/,/<\/main>/p' | \
+            sed 's/<[^>]*>//g' | \
+            sed 's/^[[:space:]]*//g' | \
+            sed 's/[[:space:]]*$//g' | \
+            sed '/^$/N;/^\n$/D' > "$dir/problem.md"
+        fi
+    elif echo "$response" | grep -q "That's not the right answer"; then
+        echo "  ✗ Wrong answer"
+        if echo "$response" | grep -q "too high"; then
+            echo "  ↳ Hint: Your answer is too high"
+        elif echo "$response" | grep -q "too low"; then
+            echo "  ↳ Hint: Your answer is too low"
+        fi
+    elif echo "$response" | grep -q "You gave an answer too recently"; then
+        wait_time=$(echo "$response" | grep -o "[0-9]\+m [0-9]\+s" || echo "some time")
+        echo "  ⚠ Please wait $wait_time before trying again"
+    else
+        echo "  ⚠ Unexpected response. Please check your session cookie"
+    fi
+}
+
+# Get current year/day
+YEAR=$(date +"%Y")
+if [ "$(date +"%m")" != "12" ]; then
+    YEAR=$((YEAR - 1))
+fi
+PART=1
+
+# Parse command line arguments
+COMMAND=""
+DAY=""  # Initialize DAY as empty, will be set by -d flag or current date when needed
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        init|setup|get|submit|help)
+            COMMAND="$1"
+            shift
+            ;;
+        -y|--year)
+            YEAR="$2"
+            shift 2
+            ;;
+        -d|--day)
+            DAY="$2"
+            shift 2
+            ;;
+        -p|--part)
+            PART="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            ;;
+        -*)
+            echo "Error: Unknown option: $1"
+            show_usage
+            ;;
+        *)
+            if [ -z "$ANSWER" ] && [ "$COMMAND" = "submit" ]; then
+                ANSWER="$1"
+            else
+                echo "Error: Unexpected argument: $1"
+                show_usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate inputs
+if [ -z "$COMMAND" ]; then
+    echo "Error: No command specified"
+    show_usage
+fi
+
+# Execute command
+case $COMMAND in
+    init)
+        init_environment
+        ;;
+    setup)
+        if [ -z "$DAY" ]; then
+            # No day specified, check if we're in December 1-25
+            current_month=$(date +"%m")
+            current_day=$(date +"%d")
+            if [ "$current_month" = "12" ] && [ "$current_day" -le 25 ]; then
+                # We're in December 1-25, set up all days from 1 to current day
+                setup_days 1 "$current_day"
+            else
+                echo "Error: Please specify a day (1-25) when running setup outside of December 1-25"
+                show_usage
+            fi
+        else
+            # Specific day specified
+            setup_day "$DAY"
+        fi
+        ;;
+    get)
+        if [ -z "$DAY" ]; then
+            echo "Error: Day is required for get command"
+            show_usage
+        fi
+        download_input "$DAY"
+        ;;
+    submit)
+        if [ -z "$DAY" ] || [ -z "$ANSWER" ]; then
+            echo "Error: Day and answer are required for submit command"
+            show_usage
+        fi
+        submit_answer "$DAY" "$ANSWER"
+        ;;
+    help)
+        show_usage
+        ;;
+esac 
